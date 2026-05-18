@@ -71,8 +71,8 @@ def run(cmd, **kwargs):
 
 APT_DEPS = [
     "build-essential", "fakeroot", "curl", "perl", "git",
-    "rsync", "libxml2-utils", "libplist-utils", "zip", "unzip",
-    "cmake", "pkg-config", "libssl-dev",
+    "rsync", "libxml2-utils", "libplist-utils", "libplist-dev",
+    "zip", "unzip", "cmake", "pkg-config", "libssl-dev",
 ]
 
 PACMAN_DEPS = [
@@ -83,7 +83,7 @@ PACMAN_DEPS = [
 
 DNF_DEPS = [
     "@development-tools", "fakeroot", "curl", "perl", "git",
-    "rsync", "libxml2", "libplist", "zip", "unzip",
+    "rsync", "libxml2", "libplist", "libplist-devel", "zip", "unzip",
     "cmake", "pkgconfig", "openssl-devel",
 ]
 
