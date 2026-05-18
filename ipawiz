@@ -461,7 +461,7 @@ WEB_VC_M = """#import "ViewController.h"
 @end
 """
 
-WEB_INFO_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
+INFO_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -519,12 +519,8 @@ def cmd_web(args):
     if not (folder / "index.html").exists():
         warn("No index.html at the folder root. The wrapper will show a placeholder.")
 
-    theos = os.environ.get("THEOS", str(THEOS_DIR))
-    if not Path(theos, "makefiles").exists():
-        die("Theos not found. Run:  ipawiz --setup")
-
-    raw_name = args.name or folder.name
-    app = _safe_app_name(raw_name)
+    theos = _theos_or_die()
+    app = _safe_app_name(args.name or folder.name)
     bundle_id = args.bundle_id or f"com.ipawiz.{app.lower()}"
 
     info(f"Building web wrapper: {app}  ({bundle_id})")
@@ -540,34 +536,87 @@ def cmd_web(args):
         (proj / "ViewController.h").write_text(WEB_VC_H)
         (proj / "ViewController.m").write_text(WEB_VC_M)
         (proj / "Info.plist").write_text(
-            WEB_INFO_PLIST.format(app=app, bundle_id=bundle_id)
+            INFO_PLIST.format(app=app, bundle_id=bundle_id)
         )
 
         shutil.copytree(folder, proj / "web")
 
-        env = os.environ.copy()
-        env["THEOS"] = theos
+        _build_and_package(proj, theos, args, app)
 
-        info("Compiling with Theos...")
-        result = subprocess.run(
-            ["make", "-j", str(os.cpu_count() or 2)],
-            cwd=proj, env=env,
+
+# ---------- native / Theos project builds ----------
+
+def _theos_or_die() -> str:
+    theos = os.environ.get("THEOS", str(THEOS_DIR))
+    if not Path(theos, "makefiles").exists():
+        die("Theos not found. Run:  ipawiz --setup")
+    return theos
+
+
+def _build_and_package(proj: Path, theos: str, args, name_hint: str):
+    """Run the Theos build in `proj`, then sign + zip the .app into an IPA.
+
+    Shared by --web, --project and --app. `name_hint` is only used to prefer
+    a same-named .app when a build emits more than one bundle.
+    """
+    env = os.environ.copy()
+    env["THEOS"] = theos
+
+    info("Compiling with Theos...")
+    result = subprocess.run(
+        ["make", "-j", str(os.cpu_count() or 2)],
+        cwd=proj, env=env,
+    )
+    if result.returncode != 0:
+        die("Theos build failed. See output above.")
+
+    app_bundles = (list(proj.rglob(f"{name_hint}.app"))
+                   or list(proj.rglob("*.app")))
+    if not app_bundles:
+        die("Build succeeded but no .app bundle was produced.\n"
+            "    Is this an application project? tweak/library projects\n"
+            "    don't emit an .app and can't be packaged into an IPA.")
+
+    built_app = app_bundles[0]
+    maybe_sign(built_app, args)
+
+    out = (Path(args.output) if args.output
+           else Path.cwd() / f"{built_app.stem}.ipa")
+    make_ipa(built_app, out)
+    good(f"Wrote {out}")
+
+
+def cmd_project(args):
+    """Build an existing Theos project (a Makefile + sources) into an IPA.
+
+    This is the fully general path: anything you can express as a Theos
+    application project -- arbitrary Objective-C/C/C++ sources, custom
+    Makefile, frameworks, resources -- builds and packages here.
+    """
+    folder = Path(args.project).resolve()
+    if not folder.exists() or not folder.is_dir():
+        die(f"Project folder not found: {folder}")
+
+    has_makefile = any((folder / m).exists()
+                       for m in ("Makefile", "makefile", "GNUmakefile"))
+    if not has_makefile:
+        die(f"No Makefile in {folder}.\n"
+            "    --project expects a Theos project (a Makefile that includes\n"
+            "    $(THEOS)/makefiles/common.mk). To build from loose sources\n"
+            "    instead, use:  ipawiz --app <folder>")
+
+    theos = _theos_or_die()
+    info(f"Building Theos project: {folder.name}")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        proj = Path(tmp) / folder.name
+        # Build a copy so we never mutate the user's tree with .theos/obj.
+        shutil.copytree(
+            folder, proj, symlinks=True,
+            ignore=shutil.ignore_patterns(".git", ".theos", "obj",
+                                          "packages", "_"),
         )
-        if result.returncode != 0:
-            die("Theos build failed. See output above.")
-
-        app_bundles = list(proj.rglob(f"{app}.app"))
-        if not app_bundles:
-            app_bundles = list(proj.rglob("*.app"))
-        if not app_bundles:
-            die("Build succeeded but no .app bundle was produced.")
-
-        built_app = app_bundles[0]
-        maybe_sign(built_app, args)
-
-        out = Path(args.output) if args.output else Path.cwd() / f"{app}.ipa"
-        make_ipa(built_app, out)
-        good(f"Wrote {out}")
+        _build_and_package(proj, theos, args, folder.name)
 
 
 # ---------- argparse ----------
@@ -581,6 +630,7 @@ examples:
   ipawiz --web ./mysite                wrap a web folder into mysite.ipa
   ipawiz --web ./mysite -n "Cool App"  customize display name
   ipawiz --web ./site -b com.you.site  custom bundle id
+  ipawiz --project ./MyTweakApp        build any Theos project into an IPA
   ipawiz MyApp.app --sign-p12 cert.p12 --sign-pp dev.mobileprovision
 
 The output IPAs are unsigned by default. Sideload with SideStore, AltStore,
@@ -605,6 +655,8 @@ def build_parser():
 
     p.add_argument("--web", metavar="FOLDER",
                    help="wrap a web folder (HTML/CSS/JS) into an IPA")
+    p.add_argument("--project", metavar="FOLDER",
+                   help="build an existing Theos project (Makefile + sources)")
     p.add_argument("folder", nargs="?",
                    help="a .app directory, or a folder containing one")
 
@@ -625,6 +677,10 @@ def main():
 
     if args.setup:
         cmd_setup(args)
+        return
+
+    if args.project:
+        cmd_project(args)
         return
 
     if args.web:
