@@ -379,7 +379,6 @@ APPLICATION_NAME = {app}
 {app}_FILES = main.m AppDelegate.m ViewController.m
 {app}_FRAMEWORKS = UIKit Foundation WebKit
 {app}_CFLAGS = -fobjc-arc
-{app}_RESOURCE_DIRS = web
 
 include $(THEOS_MAKE_PATH)/application.mk
 """
@@ -398,7 +397,7 @@ APPLICATION_NAME = {app}
 {app}_FILES = {files}
 {app}_FRAMEWORKS = {frameworks}
 {app}_CFLAGS = {cflags}
-{resource_line}
+
 include $(THEOS_MAKE_PATH)/application.mk
 """
 
@@ -553,11 +552,15 @@ def cmd_web(args):
         (proj / "AppDelegate.m").write_text(WEB_APPDEL_M)
         (proj / "ViewController.h").write_text(WEB_VC_H)
         (proj / "ViewController.m").write_text(WEB_VC_M)
-        (proj / "Info.plist").write_text(
+        res = proj / "Resources"
+        res.mkdir()
+        (res / "Info.plist").write_text(
             INFO_PLIST.format(app=app, bundle_id=bundle_id)
         )
 
-        shutil.copytree(folder, proj / "web")
+        # Theos bundles Resources/ recursively, so Resources/web/ lands at
+        # <app>.app/web/ -- exactly where ViewController looks for index.html.
+        shutil.copytree(folder, res / "web")
 
         _build_and_package(proj, theos, args, app)
 
@@ -608,21 +611,33 @@ def _build_and_package(proj: Path, theos: str, args, name_hint: str):
     env["THEOS"] = theos
 
     info("Compiling with Theos...")
+    # `make stage` (not bare `make`): bare make only links the binary into
+    # the obj .app -- it never assembles Info.plist/resources. The staged
+    # bundle under .theos/_/Applications is the complete, installable one.
     result = subprocess.run(
-        ["make", "-j", str(os.cpu_count() or 2)],
+        ["make", "stage", "-j", str(os.cpu_count() or 2)],
         cwd=proj, env=env,
     )
     if result.returncode != 0:
         die("Theos build failed. See output above.")
 
-    app_bundles = (list(proj.rglob(f"{name_hint}.app"))
-                   or list(proj.rglob("*.app")))
+    staged = proj / ".theos" / "_"
+    roots = [staged] if staged.exists() else [proj]
+    app_bundles = []
+    for root in roots:
+        app_bundles = (list(root.rglob(f"{name_hint}.app"))
+                       or list(root.rglob("*.app")))
+        if app_bundles:
+            break
     if not app_bundles:
         die("Build succeeded but no .app bundle was produced.\n"
             "    Is this an application project? tweak/library projects\n"
             "    don't emit an .app and can't be packaged into an IPA.")
 
     built_app = app_bundles[0]
+    if not (built_app / "Info.plist").exists():
+        warn("Built .app has no Info.plist -- the IPA may not install "
+             "on-device. (A Theos app project needs Resources/Info.plist.)")
     maybe_sign(built_app, args)
 
     out = (Path(args.output) if args.output
@@ -714,28 +729,34 @@ def cmd_app(args):
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(h, dst)
 
-        src_plist = folder / "Info.plist"
-        if src_plist.exists():
-            shutil.copy2(src_plist, proj / "Info.plist")
-        else:
-            (proj / "Info.plist").write_text(
-                INFO_PLIST.format(app=app, bundle_id=bundle_id))
-
+        # Theos bundles Resources/ wholesale into the .app and reads
+        # Resources/Info.plist as the bundle plist, so user --resources
+        # assets and the plist all live there.
+        res_dir = proj / "Resources"
+        res_dir.mkdir(exist_ok=True)
         if args.resources:
-            res = Path(args.resources).resolve()
-            if not res.is_dir():
-                die(f"--resources is not a directory: {res}")
-            shutil.copytree(res, proj / "Resources")
-            resource_line = f"{app}_RESOURCE_DIRS = Resources"
+            src_res = Path(args.resources).resolve()
+            if not src_res.is_dir():
+                die(f"--resources is not a directory: {src_res}")
+            for item in src_res.iterdir():
+                target = res_dir / item.name
+                if item.is_dir():
+                    shutil.copytree(item, target)
+                else:
+                    shutil.copy2(item, target)
+
+        user_plist = folder / "Info.plist"
+        if user_plist.exists():
+            shutil.copy2(user_plist, res_dir / "Info.plist")
         else:
-            resource_line = ""
+            (res_dir / "Info.plist").write_text(
+                INFO_PLIST.format(app=app, bundle_id=bundle_id))
 
         (proj / "Makefile").write_text(GENERIC_MAKEFILE.format(
             app=app,
             files=" ".join(rel_files),
             frameworks=" ".join(frameworks),
             cflags="-fobjc-arc" if objc else "",
-            resource_line=resource_line,
         ))
 
         _build_and_package(proj, theos, args, app)
