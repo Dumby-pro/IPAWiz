@@ -71,8 +71,8 @@ def run(cmd, **kwargs):
 
 APT_DEPS = [
     "build-essential", "fakeroot", "curl", "perl", "git",
-    "rsync", "libxml2-utils", "libplist-utils", "zip", "unzip",
-    "cmake", "pkg-config", "libssl-dev",
+    "rsync", "libxml2-utils", "libplist-utils", "libplist-dev",
+    "zip", "unzip", "cmake", "pkg-config", "libssl-dev",
 ]
 
 PACMAN_DEPS = [
@@ -83,7 +83,7 @@ PACMAN_DEPS = [
 
 DNF_DEPS = [
     "@development-tools", "fakeroot", "curl", "perl", "git",
-    "rsync", "libxml2", "libplist", "zip", "unzip",
+    "rsync", "libxml2", "libplist", "libplist-devel", "zip", "unzip",
     "cmake", "pkgconfig", "openssl-devel",
 ]
 
@@ -145,6 +145,78 @@ def install_theos():
     info(f"Cloning Theos to {THEOS_DIR}...")
     run(["git", "clone", "--recursive",
          "https://github.com/theos/theos.git", str(THEOS_DIR)])
+
+
+TOOLCHAIN_URL = (
+    "https://github.com/sbingner/llvm-project/releases/latest/download/"
+    "linux-ios-arm64e-clang-toolchain.tar.lzma"
+)
+
+
+def install_toolchain():
+    """Install the Linux->iOS cross-compiler clang toolchain Theos needs.
+
+    Theos itself does not bundle a toolchain; without one, builds fail with
+    'No such file or directory' on $THEOS/toolchain/linux/iphone/bin/clang.
+    We install sbingner's arm64e toolchain, which is the toolchain currently
+    recommended by the Theos wiki for Linux.
+    """
+    tc_dir = THEOS_DIR / "toolchain" / "linux" / "iphone"
+    if (tc_dir / "bin" / "clang").exists():
+        good("Theos toolchain already installed")
+        return
+    info("Downloading iOS cross-compiler toolchain (~200MB)...")
+    IPAWIZ_DIR.mkdir(exist_ok=True)
+    tarball = IPAWIZ_DIR / "linux-ios-arm64e-clang-toolchain.tar.lzma"
+    run(["curl", "-fL", "-o", str(tarball), TOOLCHAIN_URL])
+    tc_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        # GNU tar handles .lzma with --lzma; BSD tar with -J only handles xz.
+        run(["tar", "--lzma", "-xf", str(tarball), "-C", tmp])
+        # Archive layout: ios-arm64e-clang-toolchain/{bin,lib,...}
+        candidates = [p for p in Path(tmp).iterdir() if p.is_dir()]
+        if not candidates:
+            die("Toolchain archive contained no directories; layout unexpected.")
+        src = candidates[0]
+        for item in src.iterdir():
+            shutil.move(str(item), str(tc_dir / item.name))
+    try:
+        tarball.unlink()
+    except OSError:
+        pass
+    good(f"Installed toolchain to {tc_dir}")
+    _verify_toolchain(tc_dir)
+
+
+def _verify_toolchain(tc_dir):
+    """Run `clang --version` to surface load-time errors at setup time.
+
+    The sbingner toolchain links against libtinfo.so.5, which has been
+    dropped from Ubuntu 24.04's default repos. Catching this here lets us
+    print a clear pointer instead of letting users hit a cryptic
+    'shared library not found' error on their first build.
+    """
+    clang = tc_dir / "bin" / "clang"
+    if not clang.exists():
+        return
+    try:
+        r = subprocess.run([str(clang), "--version"],
+                           capture_output=True, text=True)
+    except OSError as e:
+        warn(f"Could not run clang sanity check: {e}")
+        return
+    if r.returncode == 0:
+        return
+    err = (r.stderr or "") + (r.stdout or "")
+    if "libtinfo.so.5" in err:
+        warn("Toolchain clang requires libtinfo.so.5, dropped from Ubuntu 24.04+ default repos.")
+        warn("Fix it by grabbing the jammy package — current URL (verify at https://packages.ubuntu.com/libtinfo5):")
+        dim("  wget http://security.ubuntu.com/ubuntu/pool/universe/n/ncurses/"
+            "libtinfo5_6.3-2ubuntu0.1_amd64.deb")
+        dim("  sudo apt install ./libtinfo5_6.3-2ubuntu0.1_amd64.deb")
+        warn("On older Debian/Ubuntu (focal, jammy): `sudo apt install libtinfo5`.")
+    else:
+        warn(f"Toolchain clang sanity check failed:\n{err.strip()}")
 
 
 def install_ios_sdk():
@@ -210,6 +282,7 @@ def cmd_setup(args):
     install_system_deps()
     install_ldid()
     install_theos()
+    install_toolchain()
     install_ios_sdk()
     if args.sign:
         install_zsign()
@@ -296,7 +369,7 @@ def cmd_folder(args):
 
 # ---------- web wrapper ----------
 
-WEB_MAKEFILE = """TARGET := iphone:clang:latest:14.0
+WEB_MAKEFILE = """TARGET := iphone:clang:14.5:14.0
 ARCHS = arm64
 
 include $(THEOS)/makefiles/common.mk
