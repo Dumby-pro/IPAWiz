@@ -379,7 +379,24 @@ APPLICATION_NAME = {app}
 {app}_FILES = main.m AppDelegate.m ViewController.m
 {app}_FRAMEWORKS = UIKit Foundation WebKit
 {app}_CFLAGS = -fobjc-arc
-{app}_RESOURCE_DIRS = web
+
+include $(THEOS_MAKE_PATH)/application.mk
+"""
+
+# Generic native-app Makefile. .swift entries in {files} are built by Theos
+# automatically *if* a Swift compiler is available in the toolchain -- the
+# stock --setup toolchain (clang 10) has none; see docs/SWIFT_TOOLCHAIN.md.
+# SDK pinned to 14.5 for the clang-10 toolchain (see git history / Fix 3).
+GENERIC_MAKEFILE = """TARGET := iphone:clang:14.5:14.0
+ARCHS = arm64
+
+include $(THEOS)/makefiles/common.mk
+
+APPLICATION_NAME = {app}
+
+{app}_FILES = {files}
+{app}_FRAMEWORKS = {frameworks}
+{app}_CFLAGS = {cflags}
 
 include $(THEOS_MAKE_PATH)/application.mk
 """
@@ -461,7 +478,7 @@ WEB_VC_M = """#import "ViewController.h"
 @end
 """
 
-WEB_INFO_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
+INFO_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -519,12 +536,8 @@ def cmd_web(args):
     if not (folder / "index.html").exists():
         warn("No index.html at the folder root. The wrapper will show a placeholder.")
 
-    theos = os.environ.get("THEOS", str(THEOS_DIR))
-    if not Path(theos, "makefiles").exists():
-        die("Theos not found. Run:  ipawiz --setup")
-
-    raw_name = args.name or folder.name
-    app = _safe_app_name(raw_name)
+    theos = _theos_or_die()
+    app = _safe_app_name(args.name or folder.name)
     bundle_id = args.bundle_id or f"com.ipawiz.{app.lower()}"
 
     info(f"Building web wrapper: {app}  ({bundle_id})")
@@ -539,35 +552,214 @@ def cmd_web(args):
         (proj / "AppDelegate.m").write_text(WEB_APPDEL_M)
         (proj / "ViewController.h").write_text(WEB_VC_H)
         (proj / "ViewController.m").write_text(WEB_VC_M)
-        (proj / "Info.plist").write_text(
-            WEB_INFO_PLIST.format(app=app, bundle_id=bundle_id)
+        res = proj / "Resources"
+        res.mkdir()
+        (res / "Info.plist").write_text(
+            INFO_PLIST.format(app=app, bundle_id=bundle_id)
         )
 
-        shutil.copytree(folder, proj / "web")
+        # Theos bundles Resources/ recursively, so Resources/web/ lands at
+        # <app>.app/web/ -- exactly where ViewController looks for index.html.
+        shutil.copytree(folder, res / "web")
 
-        env = os.environ.copy()
-        env["THEOS"] = theos
+        _build_and_package(proj, theos, args, app)
 
-        info("Compiling with Theos...")
-        result = subprocess.run(
-            ["make", "-j", str(os.cpu_count() or 2)],
-            cwd=proj, env=env,
+
+# ---------- native / Theos project builds ----------
+
+def _theos_or_die() -> str:
+    theos = os.environ.get("THEOS", str(THEOS_DIR))
+    if not Path(theos, "makefiles").exists():
+        die("Theos not found. Run:  ipawiz --setup")
+    return theos
+
+
+def _swift_preflight(theos: str, swift_files):
+    """Warn early (don't die) when Swift sources need a compiler we lack.
+
+    Theos builds .swift sources only if a Swift compiler is on PATH or in
+    the toolchain. The toolchain `ipawiz --setup` installs (sbingner's
+    clang 10) has no swiftc, so Swift parts won't compile yet -- the
+    Obj-C/C parts still build fine. Real Swift->iOS on Linux needs the
+    official swift.org Linux toolchain wired into Theos; the research and
+    options are written up in docs/SWIFT_TOOLCHAIN.md.
+    """
+    if not swift_files:
+        return
+    tc_bin = Path(theos) / "toolchain" / "linux" / "iphone" / "bin"
+    have_swiftc = ((tc_bin / "swiftc").exists()
+                   or (tc_bin / "swift").exists()
+                   or shutil.which("swiftc") is not None)
+    if have_swiftc:
+        good(f"Swift compiler detected; Theos will build "
+             f"{len(swift_files)} .swift file(s).")
+        return
+    warn(f"{len(swift_files)} Swift source(s) found but no Swift compiler "
+         f"is available.")
+    warn("The toolchain `ipawiz --setup` installs (clang 10) has no swiftc,")
+    warn("so .swift will NOT compile yet; Obj-C/C in this app still builds.")
+    dim("Wiring in a Swift-capable toolchain: see docs/SWIFT_TOOLCHAIN.md")
+
+
+def _build_and_package(proj: Path, theos: str, args, name_hint: str):
+    """Run the Theos build in `proj`, then sign + zip the .app into an IPA.
+
+    Shared by --web, --project and --app. `name_hint` is only used to prefer
+    a same-named .app when a build emits more than one bundle.
+    """
+    env = os.environ.copy()
+    env["THEOS"] = theos
+
+    info("Compiling with Theos...")
+    # `make stage` (not bare `make`): bare make only links the binary into
+    # the obj .app -- it never assembles Info.plist/resources. The staged
+    # bundle under .theos/_/Applications is the complete, installable one.
+    result = subprocess.run(
+        ["make", "stage", "-j", str(os.cpu_count() or 2)],
+        cwd=proj, env=env,
+    )
+    if result.returncode != 0:
+        die("Theos build failed. See output above.")
+
+    staged = proj / ".theos" / "_"
+    roots = [staged] if staged.exists() else [proj]
+    app_bundles = []
+    for root in roots:
+        app_bundles = (list(root.rglob(f"{name_hint}.app"))
+                       or list(root.rglob("*.app")))
+        if app_bundles:
+            break
+    if not app_bundles:
+        die("Build succeeded but no .app bundle was produced.\n"
+            "    Is this an application project? tweak/library projects\n"
+            "    don't emit an .app and can't be packaged into an IPA.")
+
+    built_app = app_bundles[0]
+    if not (built_app / "Info.plist").exists():
+        warn("Built .app has no Info.plist -- the IPA may not install "
+             "on-device. (A Theos app project needs Resources/Info.plist.)")
+    maybe_sign(built_app, args)
+
+    out = (Path(args.output) if args.output
+           else Path.cwd() / f"{built_app.stem}.ipa")
+    make_ipa(built_app, out)
+    good(f"Wrote {out}")
+
+
+def cmd_project(args):
+    """Build an existing Theos project (a Makefile + sources) into an IPA.
+
+    This is the fully general path: anything you can express as a Theos
+    application project -- arbitrary Objective-C/C/C++ sources, custom
+    Makefile, frameworks, resources -- builds and packages here.
+    """
+    folder = Path(args.project).resolve()
+    if not folder.exists() or not folder.is_dir():
+        die(f"Project folder not found: {folder}")
+
+    has_makefile = any((folder / m).exists()
+                       for m in ("Makefile", "makefile", "GNUmakefile"))
+    if not has_makefile:
+        die(f"No Makefile in {folder}.\n"
+            "    --project expects a Theos project (a Makefile that includes\n"
+            "    $(THEOS)/makefiles/common.mk). To build from loose sources\n"
+            "    instead, use:  ipawiz --app <folder>")
+
+    theos = _theos_or_die()
+    _swift_preflight(theos, list(folder.rglob("*.swift")))
+    info(f"Building Theos project: {folder.name}")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        proj = Path(tmp) / folder.name
+        # Build a copy so we never mutate the user's tree with .theos/obj.
+        shutil.copytree(
+            folder, proj, symlinks=True,
+            ignore=shutil.ignore_patterns(".git", ".theos", "obj",
+                                          "packages", "_"),
         )
-        if result.returncode != 0:
-            die("Theos build failed. See output above.")
+        _build_and_package(proj, theos, args, folder.name)
 
-        app_bundles = list(proj.rglob(f"{app}.app"))
-        if not app_bundles:
-            app_bundles = list(proj.rglob("*.app"))
-        if not app_bundles:
-            die("Build succeeded but no .app bundle was produced.")
 
-        built_app = app_bundles[0]
-        maybe_sign(built_app, args)
+SOURCE_EXTS = (".m", ".mm", ".c", ".cc", ".cpp", ".cxx", ".swift")
 
-        out = Path(args.output) if args.output else Path.cwd() / f"{app}.ipa"
-        make_ipa(built_app, out)
-        good(f"Wrote {out}")
+
+def cmd_app(args):
+    """Build a native app from loose sources -- no hand-written Makefile.
+
+    Point at a folder of .m/.mm/.c/.cpp/.swift (+ headers, an optional
+    Info.plist, optional --resources). ipawiz generates the Theos
+    Makefile and builds it. This is the 'completely custom app' path for
+    people who don't want to learn Theos's Makefile format.
+    """
+    folder = Path(args.app).resolve()
+    if not folder.exists() or not folder.is_dir():
+        die(f"App source folder not found: {folder}")
+
+    theos = _theos_or_die()
+
+    sources = sorted(p for p in folder.rglob("*")
+                     if p.is_file() and p.suffix in SOURCE_EXTS)
+    if not sources:
+        die(f"No source files ({', '.join(SOURCE_EXTS)}) found in {folder}.")
+
+    app = _safe_app_name(args.name or folder.name)
+    bundle_id = args.bundle_id or f"com.ipawiz.{app.lower()}"
+    frameworks = (args.frameworks or "UIKit Foundation").replace(",", " ").split()
+    swift_files = [p for p in sources if p.suffix == ".swift"]
+    objc = any(p.suffix in (".m", ".mm") for p in sources)
+    _swift_preflight(theos, swift_files)
+
+    info(f"Building native app: {app}  ({bundle_id})")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        proj = Path(tmp) / app
+        proj.mkdir()
+
+        rel_files = []
+        for s in sources:
+            rel = s.relative_to(folder)
+            dst = proj / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(s, dst)
+            rel_files.append(rel.as_posix())
+        for h in folder.rglob("*.h"):
+            if h.is_file():
+                rel = h.relative_to(folder)
+                dst = proj / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(h, dst)
+
+        # Theos bundles Resources/ wholesale into the .app and reads
+        # Resources/Info.plist as the bundle plist, so user --resources
+        # assets and the plist all live there.
+        res_dir = proj / "Resources"
+        res_dir.mkdir(exist_ok=True)
+        if args.resources:
+            src_res = Path(args.resources).resolve()
+            if not src_res.is_dir():
+                die(f"--resources is not a directory: {src_res}")
+            for item in src_res.iterdir():
+                target = res_dir / item.name
+                if item.is_dir():
+                    shutil.copytree(item, target)
+                else:
+                    shutil.copy2(item, target)
+
+        user_plist = folder / "Info.plist"
+        if user_plist.exists():
+            shutil.copy2(user_plist, res_dir / "Info.plist")
+        else:
+            (res_dir / "Info.plist").write_text(
+                INFO_PLIST.format(app=app, bundle_id=bundle_id))
+
+        (proj / "Makefile").write_text(GENERIC_MAKEFILE.format(
+            app=app,
+            files=" ".join(rel_files),
+            frameworks=" ".join(frameworks),
+            cflags="-fobjc-arc" if objc else "",
+        ))
+
+        _build_and_package(proj, theos, args, app)
 
 
 # ---------- argparse ----------
@@ -581,6 +773,9 @@ examples:
   ipawiz --web ./mysite                wrap a web folder into mysite.ipa
   ipawiz --web ./mysite -n "Cool App"  customize display name
   ipawiz --web ./site -b com.you.site  custom bundle id
+  ipawiz --project ./MyTweakApp        build any Theos project into an IPA
+  ipawiz --app ./src -n MyApp          build loose .m/.swift sources into an IPA
+  ipawiz --app ./src --frameworks "UIKit Foundation CoreLocation"
   ipawiz MyApp.app --sign-p12 cert.p12 --sign-pp dev.mobileprovision
 
 The output IPAs are unsigned by default. Sideload with SideStore, AltStore,
@@ -605,11 +800,21 @@ def build_parser():
 
     p.add_argument("--web", metavar="FOLDER",
                    help="wrap a web folder (HTML/CSS/JS) into an IPA")
+    p.add_argument("--project", metavar="FOLDER",
+                   help="build an existing Theos project (Makefile + sources)")
+    p.add_argument("--app", metavar="FOLDER",
+                   help="build a native app from loose sources "
+                        "(.m/.mm/.c/.cpp/.swift); Makefile generated for you")
     p.add_argument("folder", nargs="?",
                    help="a .app directory, or a folder containing one")
 
-    p.add_argument("-n", "--name", help="display name (web mode)")
-    p.add_argument("-b", "--bundle-id", help="bundle identifier (web mode)")
+    p.add_argument("-n", "--name", help="display name (web/app mode)")
+    p.add_argument("-b", "--bundle-id", help="bundle identifier (web/app mode)")
+    p.add_argument("--frameworks",
+                   help="space/comma-separated frameworks for --app "
+                        "(default: UIKit Foundation)")
+    p.add_argument("--resources", metavar="DIR",
+                   help="resource directory to bundle into the app (--app mode)")
     p.add_argument("-o", "--output", help="output IPA path")
 
     p.add_argument("--sign-p12", help="path to signing certificate (.p12)")
@@ -625,6 +830,14 @@ def main():
 
     if args.setup:
         cmd_setup(args)
+        return
+
+    if args.project:
+        cmd_project(args)
+        return
+
+    if args.app:
+        cmd_app(args)
         return
 
     if args.web:
