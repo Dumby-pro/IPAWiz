@@ -20,6 +20,7 @@ import sys
 import tempfile
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 VERSION = "0.1.0"
@@ -89,6 +90,21 @@ def sudo_prefix() -> list:
         return ["sudo"]
     die("Not running as root and `sudo` is not on PATH. Re-run as root "
         "or install sudo first.")
+
+
+def _parallel(*fns):
+    """Run zero-arg callables concurrently; re-raise the first failure.
+
+    Every install_* step in --setup is either idempotent (early-returns
+    when the artifact already exists) or network-bound; overlapping the
+    network waits is the biggest first-run speedup available.
+    """
+    if not fns:
+        return
+    with ThreadPoolExecutor(max_workers=len(fns)) as ex:
+        futs = [ex.submit(fn) for fn in fns]
+        for f in as_completed(futs):
+            f.result()
 
 
 # Split into "always needed" and "only needed to build zsign" so a plain
@@ -170,7 +186,8 @@ def install_system_deps(sign: bool):
         info(f"Installing {len(missing)} apt package(s): {' '.join(missing)}")
         if not _apt_cache_fresh():
             run([*sudo_prefix(), "apt-get", "update"])
-        run([*sudo_prefix(), "apt-get", "install", "-y", *missing])
+        run([*sudo_prefix(), "apt-get", "install", "-y",
+             "--no-install-recommends", *missing])
     elif mgr == "dnf":
         deps = [*CORE_DNF_DEPS, *(SIGN_DNF_DEPS if sign else [])]
         missing = [p for p in deps if p not in _rpm_installed(deps)]
@@ -200,7 +217,8 @@ def install_ldid():
 
     if detect_pkg_manager() == "apt":
         info("Trying to install ldid via apt...")
-        r = subprocess.run([*sudo_prefix(), "apt-get", "install", "-y", "ldid"])
+        r = subprocess.run([*sudo_prefix(), "apt-get", "install", "-y",
+                            "--no-install-recommends", "ldid"])
         if r.returncode == 0 and shutil.which("ldid"):
             good("Installed ldid via apt")
             return
@@ -231,6 +249,7 @@ def install_theos():
     # --recursive clone but pulls a fraction of the bytes.
     run(["git", "clone", "--depth=1",
          "--recurse-submodules", "--shallow-submodules",
+         f"--jobs={os.cpu_count() or 4}",
          "https://github.com/theos/theos.git", str(THEOS_DIR)])
 
 
@@ -252,25 +271,29 @@ def install_toolchain():
     if (tc_dir / "bin" / "clang").exists():
         good("Theos toolchain already installed")
         return
-    info("Downloading iOS cross-compiler toolchain (~200MB)...")
-    IPAWIZ_DIR.mkdir(exist_ok=True)
-    tarball = IPAWIZ_DIR / "linux-ios-arm64e-clang-toolchain.tar.lzma"
-    run(["curl", "-fL", "-o", str(tarball), TOOLCHAIN_URL])
+    info("Downloading + extracting iOS cross-compiler toolchain (~100MB)...")
     tc_dir.mkdir(parents=True, exist_ok=True)
+    # Stream curl -> tar so we never write the 100MB tarball to disk and
+    # overlap network I/O with LZMA decode. --strip-components=1 collapses
+    # the archive's single top-level dir (ios-arm64e-clang-toolchain/) into
+    # our target. Extract to a tempdir first so a broken download can't
+    # leave a half-installed toolchain in place.
     with tempfile.TemporaryDirectory() as tmp:
+        curl_p = subprocess.Popen(
+            ["curl", "-sSfL", TOOLCHAIN_URL], stdout=subprocess.PIPE,
+        )
         # GNU tar handles .lzma with --lzma; BSD tar with -J only handles xz.
-        run(["tar", "--lzma", "-xf", str(tarball), "-C", tmp])
-        # Archive layout: ios-arm64e-clang-toolchain/{bin,lib,...}
-        candidates = [p for p in Path(tmp).iterdir() if p.is_dir()]
-        if not candidates:
-            die("Toolchain archive contained no directories; layout unexpected.")
-        src = candidates[0]
-        for item in src.iterdir():
+        tar_rc = subprocess.call(
+            ["tar", "--lzma", "-xf", "-", "--strip-components=1", "-C", tmp],
+            stdin=curl_p.stdout,
+        )
+        curl_p.stdout.close()
+        curl_rc = curl_p.wait()
+        if curl_rc != 0 or tar_rc != 0:
+            die(f"Toolchain download/extract failed "
+                f"(curl={curl_rc}, tar={tar_rc}).")
+        for item in Path(tmp).iterdir():
             shutil.move(str(item), str(tc_dir / item.name))
-    try:
-        tarball.unlink()
-    except OSError:
-        pass
     good(f"Installed toolchain to {tc_dir}")
     _verify_toolchain(tc_dir)
 
@@ -382,13 +405,24 @@ def cmd_setup(args):
     info("Setting up IPAWiz build environment...")
     IPAWIZ_DIR.mkdir(exist_ok=True)
 
-    install_system_deps(args.sign)
-    install_ldid()
-    install_theos()
-    install_toolchain()
-    install_ios_sdk()
+    # Phase 1: apt (may need sudo) + Theos clone are independent and both
+    # network-bound -- run in parallel so first-run wall time is bounded by
+    # the slower of the two, not their sum.
+    _parallel(
+        lambda: install_system_deps(args.sign),
+        install_theos,
+    )
+
+    # Phase 2: everything left is either dependent on Theos existing
+    # (install_toolchain / install_ios_sdk both write under $THEOS_DIR --
+    # they'd race install_theos's `git clone`, which requires the target
+    # empty) or on apt being done (install_ldid may install via apt).
+    # Within the phase they're independent of each other.
+    tasks = [install_ldid, install_toolchain, install_ios_sdk]
     if args.sign:
-        install_zsign()
+        tasks.append(install_zsign)
+    _parallel(*tasks)
+
     write_shell_env()
 
     good("Setup complete.")
