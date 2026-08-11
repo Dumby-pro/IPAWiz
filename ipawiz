@@ -91,23 +91,26 @@ def sudo_prefix() -> list:
         "or install sudo first.")
 
 
-APT_DEPS = [
+# Split into "always needed" and "only needed to build zsign" so a plain
+# --setup doesn't pull cmake/openssl into the base install. zip/unzip
+# removed: make_ipa uses Python's zipfile stdlib, not the binaries.
+CORE_APT_DEPS = [
     "build-essential", "fakeroot", "curl", "perl", "git",
     "rsync", "libxml2-utils", "libplist-utils", "libplist-dev",
-    "zip", "unzip", "cmake", "pkg-config", "libssl-dev",
 ]
+SIGN_APT_DEPS = ["cmake", "pkg-config", "libssl-dev"]
 
-PACMAN_DEPS = [
+CORE_PACMAN_DEPS = [
     "base-devel", "fakeroot", "curl", "perl", "git",
-    "rsync", "libxml2", "libplist", "zip", "unzip",
-    "cmake", "pkgconf", "openssl",
+    "rsync", "libxml2", "libplist",
 ]
+SIGN_PACMAN_DEPS = ["cmake", "pkgconf", "openssl"]
 
-DNF_DEPS = [
+CORE_DNF_DEPS = [
     "@development-tools", "fakeroot", "curl", "perl", "git",
-    "rsync", "libxml2", "libplist", "libplist-devel", "zip", "unzip",
-    "cmake", "pkgconfig", "openssl-devel",
+    "rsync", "libxml2", "libplist", "libplist-devel",
 ]
+SIGN_DNF_DEPS = ["cmake", "pkgconfig", "openssl-devel"]
 
 
 def detect_pkg_manager():
@@ -117,18 +120,74 @@ def detect_pkg_manager():
     return None
 
 
-def install_system_deps():
+def _apt_installed(pkgs) -> set:
+    if not pkgs:
+        return set()
+    r = subprocess.run(
+        ["dpkg-query", "-W", "-f=${db:Status-Status}\\t${Package}\\n", *pkgs],
+        capture_output=True, text=True,
+    )
+    return {line.split("\t", 1)[1]
+            for line in r.stdout.splitlines()
+            if line.startswith("installed\t")}
+
+
+def _apt_cache_fresh(hours: int = 24) -> bool:
+    stamp = Path("/var/lib/apt/periodic/update-success-stamp")
+    if not stamp.exists():
+        return False
+    return (time.time() - stamp.stat().st_mtime) / 3600 < hours
+
+
+def _rpm_installed(pkgs) -> set:
+    installed = set()
+    for p in pkgs:
+        # @groups aren't rpm-queryable; let dnf decide (it no-ops if satisfied).
+        if p.startswith("@"):
+            continue
+        if subprocess.run(["rpm", "-q", "--quiet", p]).returncode == 0:
+            installed.add(p)
+    return installed
+
+
+def _pacman_installed(pkgs) -> set:
+    installed = set()
+    for p in pkgs:
+        r = subprocess.run(["pacman", "-Qi", p], capture_output=True)
+        if r.returncode == 0:
+            installed.add(p)
+    return installed
+
+
+def install_system_deps(sign: bool):
     mgr = detect_pkg_manager()
     if mgr == "apt":
-        info("Installing apt dependencies...")
-        run([*sudo_prefix(), "apt-get", "update"])
-        run([*sudo_prefix(), "apt-get", "install", "-y", *APT_DEPS])
+        deps = [*CORE_APT_DEPS, *(SIGN_APT_DEPS if sign else [])]
+        missing = [p for p in deps if p not in _apt_installed(deps)]
+        if not missing:
+            good("System deps already installed")
+            return
+        info(f"Installing {len(missing)} apt package(s): {' '.join(missing)}")
+        if not _apt_cache_fresh():
+            run([*sudo_prefix(), "apt-get", "update"])
+        run([*sudo_prefix(), "apt-get", "install", "-y", *missing])
     elif mgr == "dnf":
-        info("Installing dnf dependencies...")
-        run([*sudo_prefix(), "dnf", "install", "-y", *DNF_DEPS])
+        deps = [*CORE_DNF_DEPS, *(SIGN_DNF_DEPS if sign else [])]
+        missing = [p for p in deps if p not in _rpm_installed(deps)]
+        if not missing:
+            good("System deps already installed")
+            return
+        info(f"Installing {len(missing)} dnf package(s): {' '.join(missing)}")
+        run([*sudo_prefix(), "dnf", "install", "-y", *missing])
     elif mgr == "pacman":
-        info("Installing pacman dependencies...")
-        run([*sudo_prefix(), "pacman", "-Sy", "--needed", "--noconfirm", *PACMAN_DEPS])
+        deps = [*CORE_PACMAN_DEPS, *(SIGN_PACMAN_DEPS if sign else [])]
+        missing = [p for p in deps if p not in _pacman_installed(deps)]
+        if not missing:
+            good("System deps already installed")
+            return
+        info(f"Installing {len(missing)} pacman package(s): {' '.join(missing)}")
+        run([*sudo_prefix(), "pacman", "-S",
+             "--needed", "--noconfirm", *missing])
     else:
         die("No supported package manager found (apt/dnf/pacman). Install build deps manually.")
 
@@ -164,8 +223,14 @@ def install_theos():
     if THEOS_DIR.exists() and (THEOS_DIR / "makefiles").exists():
         good(f"Theos already installed at {THEOS_DIR}")
         return
-    info(f"Cloning Theos to {THEOS_DIR}...")
-    run(["git", "clone", "--recursive",
+    info(f"Cloning Theos (shallow, shallow submodules) to {THEOS_DIR}...")
+    # Application builds actually DO need Theos's vendor/{include,lib}
+    # submodules (application.mk pulls headers from there). We still avoid
+    # the full history of Theos and every submodule: --depth=1 +
+    # --shallow-submodules keeps working-tree parity with a plain
+    # --recursive clone but pulls a fraction of the bytes.
+    run(["git", "clone", "--depth=1",
+         "--recurse-submodules", "--shallow-submodules",
          "https://github.com/theos/theos.git", str(THEOS_DIR)])
 
 
@@ -242,26 +307,41 @@ def _verify_toolchain(tc_dir):
         warn(f"Toolchain clang sanity check failed:\n{err.strip()}")
 
 
+# Keep in sync with the SDK version baked into WEB_MAKEFILE /
+# GENERIC_MAKEFILE (`iphone:clang:14.5:14.0`). Installing only this one
+# SDK -- instead of every SDK in theos/sdks -- is the biggest win in
+# --setup: theos/sdks is ~3GB in full, this transfers a fraction.
+PINNED_IOS_SDK = "iPhoneOS14.5.sdk"
+
+
 def install_ios_sdk():
     sdks_dir = THEOS_DIR / "sdks"
     sdks_dir.mkdir(exist_ok=True)
     if any(sdks_dir.glob("iPhoneOS*.sdk")):
         good("iOS SDK already present")
         return
-    info("Downloading iOS SDK from theos/sdks (this is large, ~600MB)...")
+    info(f"Downloading {PINNED_IOS_SDK} (sparse checkout of theos/sdks)...")
     tmp = sdks_dir / "_clone"
     if tmp.exists():
         shutil.rmtree(tmp)
-    run(["git", "clone", "--depth=1",
+    # --filter=blob:none + --sparse pulls only tree metadata; sparse-checkout
+    # then materializes just the one SDK dir. Older git without --sparse
+    # would fall through to a full checkout; we require git >= 2.25.
+    run(["git", "clone", "--depth=1", "--filter=blob:none", "--sparse",
          "https://github.com/theos/sdks.git", str(tmp)])
-    moved = 0
-    for sdk in tmp.glob("iPhoneOS*.sdk"):
-        shutil.move(str(sdk), str(sdks_dir / sdk.name))
-        moved += 1
+    run(["git", "-C", str(tmp), "sparse-checkout", "set", PINNED_IOS_SDK])
+    src = tmp / PINNED_IOS_SDK
+    if not src.exists():
+        # Fallback if the pinned name has been renamed upstream.
+        found = list(tmp.glob("iPhoneOS*.sdk"))
+        if not found:
+            shutil.rmtree(tmp)
+            die(f"{PINNED_IOS_SDK} not found in theos/sdks. "
+                "Check the repo manually.")
+        src = found[0]
+    shutil.move(str(src), str(sdks_dir / src.name))
     shutil.rmtree(tmp)
-    if moved == 0:
-        die("No iPhoneOS SDKs found in theos/sdks. Check the repo manually.")
-    good(f"Installed {moved} iOS SDK(s)")
+    good(f"Installed {src.name}")
 
 
 def install_zsign():
@@ -302,7 +382,7 @@ def cmd_setup(args):
     info("Setting up IPAWiz build environment...")
     IPAWIZ_DIR.mkdir(exist_ok=True)
 
-    install_system_deps()
+    install_system_deps(args.sign)
     install_ldid()
     install_theos()
     install_toolchain()
