@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -69,6 +70,27 @@ def run(cmd, **kwargs):
 
 # ---------- setup ----------
 
+def _is_root() -> bool:
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def sudo_prefix() -> list:
+    """Return ['sudo'] when we need to escalate, [] when already root.
+
+    Bare `sudo apt-get ...` fails in root-only environments (minimal
+    containers, initial CI images) that don't ship sudo; skipping the
+    prefix when we're already uid 0 is both safer and one less password
+    prompt. If we're not root and sudo isn't installed, fail clearly --
+    we can't install system packages without escalation.
+    """
+    if _is_root():
+        return []
+    if shutil.which("sudo"):
+        return ["sudo"]
+    die("Not running as root and `sudo` is not on PATH. Re-run as root "
+        "or install sudo first.")
+
+
 APT_DEPS = [
     "build-essential", "fakeroot", "curl", "perl", "git",
     "rsync", "libxml2-utils", "libplist-utils", "libplist-dev",
@@ -99,14 +121,14 @@ def install_system_deps():
     mgr = detect_pkg_manager()
     if mgr == "apt":
         info("Installing apt dependencies...")
-        run(["sudo", "apt-get", "update"])
-        run(["sudo", "apt-get", "install", "-y", *APT_DEPS])
+        run([*sudo_prefix(), "apt-get", "update"])
+        run([*sudo_prefix(), "apt-get", "install", "-y", *APT_DEPS])
     elif mgr == "dnf":
         info("Installing dnf dependencies...")
-        run(["sudo", "dnf", "install", "-y", *DNF_DEPS])
+        run([*sudo_prefix(), "dnf", "install", "-y", *DNF_DEPS])
     elif mgr == "pacman":
         info("Installing pacman dependencies...")
-        run(["sudo", "pacman", "-Sy", "--needed", "--noconfirm", *PACMAN_DEPS])
+        run([*sudo_prefix(), "pacman", "-Sy", "--needed", "--noconfirm", *PACMAN_DEPS])
     else:
         die("No supported package manager found (apt/dnf/pacman). Install build deps manually.")
 
@@ -119,7 +141,7 @@ def install_ldid():
 
     if detect_pkg_manager() == "apt":
         info("Trying to install ldid via apt...")
-        r = subprocess.run(["sudo", "apt-get", "install", "-y", "ldid"])
+        r = subprocess.run([*sudo_prefix(), "apt-get", "install", "-y", "ldid"])
         if r.returncode == 0 and shutil.which("ldid"):
             good("Installed ldid via apt")
             return
@@ -209,12 +231,13 @@ def _verify_toolchain(tc_dir):
         return
     err = (r.stderr or "") + (r.stdout or "")
     if "libtinfo.so.5" in err:
+        s = "" if _is_root() else "sudo "
         warn("Toolchain clang requires libtinfo.so.5, dropped from Ubuntu 24.04+ default repos.")
         warn("Fix it by grabbing the jammy package — current URL (verify at https://packages.ubuntu.com/libtinfo5):")
         dim("  wget http://security.ubuntu.com/ubuntu/pool/universe/n/ncurses/"
             "libtinfo5_6.3-2ubuntu0.1_amd64.deb")
-        dim("  sudo apt install ./libtinfo5_6.3-2ubuntu0.1_amd64.deb")
-        warn("On older Debian/Ubuntu (focal, jammy): `sudo apt install libtinfo5`.")
+        dim(f"  {s}apt install ./libtinfo5_6.3-2ubuntu0.1_amd64.deb")
+        warn(f"On older Debian/Ubuntu (focal, jammy): `{s}apt install libtinfo5`.")
     else:
         warn(f"Toolchain clang sanity check failed:\n{err.strip()}")
 
