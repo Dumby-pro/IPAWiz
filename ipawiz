@@ -14,11 +14,15 @@ TrollStore (which will sign them on-device), or sign yourself with zsign + a
 
 import argparse
 import os
+import platform
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 VERSION = "0.1.0"
@@ -69,23 +73,62 @@ def run(cmd, **kwargs):
 
 # ---------- setup ----------
 
-APT_DEPS = [
+def _is_root() -> bool:
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def sudo_prefix() -> list:
+    """Return ['sudo'] when we need to escalate, [] when already root.
+
+    Bare `sudo apt-get ...` fails in root-only environments (minimal
+    containers, initial CI images) that don't ship sudo; skipping the
+    prefix when we're already uid 0 is both safer and one less password
+    prompt. If we're not root and sudo isn't installed, fail clearly --
+    we can't install system packages without escalation.
+    """
+    if _is_root():
+        return []
+    if shutil.which("sudo"):
+        return ["sudo"]
+    die("Not running as root and `sudo` is not on PATH. Re-run as root "
+        "or install sudo first.")
+
+
+def _parallel(*fns):
+    """Run zero-arg callables concurrently; re-raise the first failure.
+
+    Every install_* step in --setup is either idempotent (early-returns
+    when the artifact already exists) or network-bound; overlapping the
+    network waits is the biggest first-run speedup available.
+    """
+    if not fns:
+        return
+    with ThreadPoolExecutor(max_workers=len(fns)) as ex:
+        futs = [ex.submit(fn) for fn in fns]
+        for f in as_completed(futs):
+            f.result()
+
+
+# Split into "always needed" and "only needed to build zsign" so a plain
+# --setup doesn't pull cmake/openssl into the base install. zip/unzip
+# removed: make_ipa uses Python's zipfile stdlib, not the binaries.
+CORE_APT_DEPS = [
     "build-essential", "fakeroot", "curl", "perl", "git",
     "rsync", "libxml2-utils", "libplist-utils", "libplist-dev",
-    "zip", "unzip", "cmake", "pkg-config", "libssl-dev",
 ]
+SIGN_APT_DEPS = ["cmake", "pkg-config", "libssl-dev"]
 
-PACMAN_DEPS = [
+CORE_PACMAN_DEPS = [
     "base-devel", "fakeroot", "curl", "perl", "git",
-    "rsync", "libxml2", "libplist", "zip", "unzip",
-    "cmake", "pkgconf", "openssl",
+    "rsync", "libxml2", "libplist",
 ]
+SIGN_PACMAN_DEPS = ["cmake", "pkgconf", "openssl"]
 
-DNF_DEPS = [
+CORE_DNF_DEPS = [
     "@development-tools", "fakeroot", "curl", "perl", "git",
-    "rsync", "libxml2", "libplist", "libplist-devel", "zip", "unzip",
-    "cmake", "pkgconfig", "openssl-devel",
+    "rsync", "libxml2", "libplist", "libplist-devel",
 ]
+SIGN_DNF_DEPS = ["cmake", "pkgconfig", "openssl-devel"]
 
 
 def detect_pkg_manager():
@@ -95,35 +138,136 @@ def detect_pkg_manager():
     return None
 
 
-def install_system_deps():
+def _apt_installed(pkgs) -> set:
+    if not pkgs:
+        return set()
+    r = subprocess.run(
+        ["dpkg-query", "-W", "-f=${db:Status-Status}\\t${Package}\\n", *pkgs],
+        capture_output=True, text=True,
+    )
+    return {line.split("\t", 1)[1]
+            for line in r.stdout.splitlines()
+            if line.startswith("installed\t")}
+
+
+def _apt_cache_fresh(hours: int = 24) -> bool:
+    stamp = Path("/var/lib/apt/periodic/update-success-stamp")
+    if not stamp.exists():
+        return False
+    return (time.time() - stamp.stat().st_mtime) / 3600 < hours
+
+
+def _rpm_installed(pkgs) -> set:
+    installed = set()
+    for p in pkgs:
+        # @groups aren't rpm-queryable; let dnf decide (it no-ops if satisfied).
+        if p.startswith("@"):
+            continue
+        if subprocess.run(["rpm", "-q", "--quiet", p]).returncode == 0:
+            installed.add(p)
+    return installed
+
+
+def _pacman_installed(pkgs) -> set:
+    installed = set()
+    for p in pkgs:
+        r = subprocess.run(["pacman", "-Qi", p], capture_output=True)
+        if r.returncode == 0:
+            installed.add(p)
+    return installed
+
+
+def install_system_deps(sign: bool):
     mgr = detect_pkg_manager()
     if mgr == "apt":
-        info("Installing apt dependencies...")
-        run(["sudo", "apt-get", "update"])
-        run(["sudo", "apt-get", "install", "-y", *APT_DEPS])
+        deps = [*CORE_APT_DEPS, *(SIGN_APT_DEPS if sign else [])]
+        missing = [p for p in deps if p not in _apt_installed(deps)]
+        if not missing:
+            good("System deps already installed")
+            return
+        info(f"Installing {len(missing)} apt package(s): {' '.join(missing)}")
+        if not _apt_cache_fresh():
+            run([*sudo_prefix(), "apt-get", "update"])
+        run([*sudo_prefix(), "apt-get", "install", "-y",
+             "--no-install-recommends", *missing])
     elif mgr == "dnf":
-        info("Installing dnf dependencies...")
-        run(["sudo", "dnf", "install", "-y", *DNF_DEPS])
+        deps = [*CORE_DNF_DEPS, *(SIGN_DNF_DEPS if sign else [])]
+        missing = [p for p in deps if p not in _rpm_installed(deps)]
+        if not missing:
+            good("System deps already installed")
+            return
+        info(f"Installing {len(missing)} dnf package(s): {' '.join(missing)}")
+        run([*sudo_prefix(), "dnf", "install", "-y", *missing])
     elif mgr == "pacman":
-        info("Installing pacman dependencies...")
-        run(["sudo", "pacman", "-Sy", "--needed", "--noconfirm", *PACMAN_DEPS])
+        deps = [*CORE_PACMAN_DEPS, *(SIGN_PACMAN_DEPS if sign else [])]
+        missing = [p for p in deps if p not in _pacman_installed(deps)]
+        if not missing:
+            good("System deps already installed")
+            return
+        info(f"Installing {len(missing)} pacman package(s): {' '.join(missing)}")
+        run([*sudo_prefix(), "pacman", "-S",
+             "--needed", "--noconfirm", *missing])
     else:
         die("No supported package manager found (apt/dnf/pacman). Install build deps manually.")
 
 
+LDID_ARCH = {"x86_64": "x86_64", "aarch64": "aarch64"}
+
+
+def _install_ldid_prebuilt() -> bool:
+    """Download a statically-linked ldid from ProcursusTeam releases.
+
+    Skipped on unsupported CPU archs (only x86_64 / aarch64 have prebuilt
+    binaries published). Returns True on success, False otherwise so
+    callers can fall through to the next strategy.
+    """
+    arch = LDID_ARCH.get(platform.machine())
+    if arch is None:
+        return False
+    url = (f"https://github.com/ProcursusTeam/ldid/releases/latest/"
+           f"download/ldid_linux_{arch}")
+    bin_dst = Path.home() / ".local" / "bin"
+    bin_dst.mkdir(parents=True, exist_ok=True)
+    target = bin_dst / "ldid"
+    info(f"Downloading precompiled ldid ({arch}) from ProcursusTeam...")
+    r = subprocess.run(["curl", "-sSfL", "-o", str(target), url])
+    if r.returncode != 0:
+        target.unlink(missing_ok=True)
+        return False
+    target.chmod(0o755)
+    # Sanity: ldid with no args exits 1 but prints its banner. If neither
+    # channel contains the banner, we've fetched something bogus.
+    v = subprocess.run([str(target)], capture_output=True, text=True)
+    if "Link Identity Editor" not in ((v.stdout or "") + (v.stderr or "")):
+        target.unlink(missing_ok=True)
+        return False
+    good(f"Installed ldid to {target}")
+    return True
+
+
 def install_ldid():
-    """ldid does pseudo-signing required by the iOS build. Try apt, else build from source."""
+    """Get ldid on PATH -- Theos runs it to codesign every build.
+
+    Strategy, fastest -> slowest: PATH check, ProcursusTeam precompiled
+    static binary (~2s, no distro deps, no dpkg-lock contention with a
+    parallel install_system_deps), apt (only helps on distros that
+    package it), source build (last resort, 30-60s).
+    """
     if shutil.which("ldid"):
         good("ldid already installed")
         return
 
+    if _install_ldid_prebuilt():
+        return
+
     if detect_pkg_manager() == "apt":
-        info("Trying to install ldid via apt...")
-        r = subprocess.run(["sudo", "apt-get", "install", "-y", "ldid"])
+        info("Precompiled ldid unavailable; trying apt...")
+        r = subprocess.run([*sudo_prefix(), "apt-get", "install", "-y",
+                            "--no-install-recommends", "ldid"])
         if r.returncode == 0 and shutil.which("ldid"):
             good("Installed ldid via apt")
             return
-        warn("apt couldn't install ldid; building from source instead")
+        warn("apt couldn't install ldid either; building from source")
 
     info("Building ldid from source (ProcursusTeam fork)...")
     src = IPAWIZ_DIR / "src" / "ldid"
@@ -138,13 +282,27 @@ def install_ldid():
     good(f"Installed ldid to {bin_dst / 'ldid'}")
 
 
-def install_theos():
-    if THEOS_DIR.exists() and (THEOS_DIR / "makefiles").exists():
-        good(f"Theos already installed at {THEOS_DIR}")
-        return
-    info(f"Cloning Theos to {THEOS_DIR}...")
-    run(["git", "clone", "--recursive",
-         "https://github.com/theos/theos.git", str(THEOS_DIR)])
+def install_theos(done=None):
+    """Clone Theos into THEOS_DIR. If `done` is a threading.Event, set it
+    on completion (success OR failure) so parallel install_toolchain /
+    install_ios_sdk waiters unblock instead of hanging."""
+    try:
+        if THEOS_DIR.exists() and (THEOS_DIR / "makefiles").exists():
+            good(f"Theos already installed at {THEOS_DIR}")
+            return
+        info(f"Cloning Theos (shallow, shallow submodules) to {THEOS_DIR}...")
+        # Application builds actually DO need Theos's vendor/{include,lib}
+        # submodules (application.mk pulls headers from there). We still
+        # avoid the full history of Theos and every submodule: --depth=1 +
+        # --shallow-submodules keeps working-tree parity with a plain
+        # --recursive clone but pulls a fraction of the bytes.
+        run(["git", "clone", "--depth=1",
+             "--recurse-submodules", "--shallow-submodules",
+             f"--jobs={os.cpu_count() or 4}",
+             "https://github.com/theos/theos.git", str(THEOS_DIR)])
+    finally:
+        if done is not None:
+            done.set()
 
 
 TOOLCHAIN_URL = (
@@ -153,37 +311,47 @@ TOOLCHAIN_URL = (
 )
 
 
-def install_toolchain():
+def install_toolchain(theos_ready=None):
     """Install the Linux->iOS cross-compiler clang toolchain Theos needs.
 
     Theos itself does not bundle a toolchain; without one, builds fail with
     'No such file or directory' on $THEOS/toolchain/linux/iphone/bin/clang.
     We install sbingner's arm64e toolchain, which is the toolchain currently
     recommended by the Theos wiki for Linux.
+
+    If `theos_ready` is a threading.Event, wait on it before moving the
+    extracted files into $THEOS_DIR so we can safely run in parallel with
+    install_theos.
     """
     tc_dir = THEOS_DIR / "toolchain" / "linux" / "iphone"
     if (tc_dir / "bin" / "clang").exists():
         good("Theos toolchain already installed")
         return
-    info("Downloading iOS cross-compiler toolchain (~200MB)...")
-    IPAWIZ_DIR.mkdir(exist_ok=True)
-    tarball = IPAWIZ_DIR / "linux-ios-arm64e-clang-toolchain.tar.lzma"
-    run(["curl", "-fL", "-o", str(tarball), TOOLCHAIN_URL])
-    tc_dir.mkdir(parents=True, exist_ok=True)
+    info("Downloading + extracting iOS cross-compiler toolchain (~100MB)...")
+    # Fetch+extract into a tempdir OUTSIDE $THEOS_DIR so we can run in
+    # parallel with install_theos (which needs $THEOS_DIR empty for
+    # `git clone`). Rendezvous on `theos_ready` before the move step.
     with tempfile.TemporaryDirectory() as tmp:
+        curl_p = subprocess.Popen(
+            ["curl", "-sSfL", TOOLCHAIN_URL], stdout=subprocess.PIPE,
+        )
         # GNU tar handles .lzma with --lzma; BSD tar with -J only handles xz.
-        run(["tar", "--lzma", "-xf", str(tarball), "-C", tmp])
-        # Archive layout: ios-arm64e-clang-toolchain/{bin,lib,...}
-        candidates = [p for p in Path(tmp).iterdir() if p.is_dir()]
-        if not candidates:
-            die("Toolchain archive contained no directories; layout unexpected.")
-        src = candidates[0]
-        for item in src.iterdir():
+        # --strip-components=1 collapses the archive's single top-level
+        # dir (ios-arm64e-clang-toolchain/) into `tmp`.
+        tar_rc = subprocess.call(
+            ["tar", "--lzma", "-xf", "-", "--strip-components=1", "-C", tmp],
+            stdin=curl_p.stdout,
+        )
+        curl_p.stdout.close()
+        curl_rc = curl_p.wait()
+        if curl_rc != 0 or tar_rc != 0:
+            die(f"Toolchain download/extract failed "
+                f"(curl={curl_rc}, tar={tar_rc}).")
+        if theos_ready is not None:
+            theos_ready.wait()
+        tc_dir.mkdir(parents=True, exist_ok=True)
+        for item in Path(tmp).iterdir():
             shutil.move(str(item), str(tc_dir / item.name))
-    try:
-        tarball.unlink()
-    except OSError:
-        pass
     good(f"Installed toolchain to {tc_dir}")
     _verify_toolchain(tc_dir)
 
@@ -209,36 +377,53 @@ def _verify_toolchain(tc_dir):
         return
     err = (r.stderr or "") + (r.stdout or "")
     if "libtinfo.so.5" in err:
+        s = "" if _is_root() else "sudo "
         warn("Toolchain clang requires libtinfo.so.5, dropped from Ubuntu 24.04+ default repos.")
         warn("Fix it by grabbing the jammy package — current URL (verify at https://packages.ubuntu.com/libtinfo5):")
         dim("  wget http://security.ubuntu.com/ubuntu/pool/universe/n/ncurses/"
             "libtinfo5_6.3-2ubuntu0.1_amd64.deb")
-        dim("  sudo apt install ./libtinfo5_6.3-2ubuntu0.1_amd64.deb")
-        warn("On older Debian/Ubuntu (focal, jammy): `sudo apt install libtinfo5`.")
+        dim(f"  {s}apt install ./libtinfo5_6.3-2ubuntu0.1_amd64.deb")
+        warn(f"On older Debian/Ubuntu (focal, jammy): `{s}apt install libtinfo5`.")
     else:
         warn(f"Toolchain clang sanity check failed:\n{err.strip()}")
 
 
-def install_ios_sdk():
+# Keep in sync with the SDK version baked into WEB_MAKEFILE /
+# GENERIC_MAKEFILE (`iphone:clang:14.5:14.0`). Installing only this one
+# SDK -- instead of every SDK in theos/sdks -- is the biggest win in
+# --setup: theos/sdks is ~3GB in full, this transfers a fraction.
+PINNED_IOS_SDK = "iPhoneOS14.5.sdk"
+
+
+def install_ios_sdk(theos_ready=None):
     sdks_dir = THEOS_DIR / "sdks"
-    sdks_dir.mkdir(exist_ok=True)
-    if any(sdks_dir.glob("iPhoneOS*.sdk")):
+    if sdks_dir.exists() and any(sdks_dir.glob("iPhoneOS*.sdk")):
         good("iOS SDK already present")
         return
-    info("Downloading iOS SDK from theos/sdks (this is large, ~600MB)...")
-    tmp = sdks_dir / "_clone"
-    if tmp.exists():
-        shutil.rmtree(tmp)
-    run(["git", "clone", "--depth=1",
-         "https://github.com/theos/sdks.git", str(tmp)])
-    moved = 0
-    for sdk in tmp.glob("iPhoneOS*.sdk"):
-        shutil.move(str(sdk), str(sdks_dir / sdk.name))
-        moved += 1
-    shutil.rmtree(tmp)
-    if moved == 0:
-        die("No iPhoneOS SDKs found in theos/sdks. Check the repo manually.")
-    good(f"Installed {moved} iOS SDK(s)")
+    info(f"Downloading {PINNED_IOS_SDK} (sparse checkout of theos/sdks)...")
+    # Fetch into a tempdir OUTSIDE $THEOS_DIR so we can run in parallel
+    # with install_theos (which needs $THEOS_DIR empty for `git clone`).
+    # --filter=blob:none + --sparse pulls only tree metadata; sparse-checkout
+    # then materializes just the one SDK dir. Requires git >= 2.25.
+    with tempfile.TemporaryDirectory() as tmp_root:
+        tmp = Path(tmp_root) / "sdks"
+        run(["git", "clone", "--depth=1", "--filter=blob:none", "--sparse",
+             "https://github.com/theos/sdks.git", str(tmp)])
+        run(["git", "-C", str(tmp), "sparse-checkout", "set", PINNED_IOS_SDK])
+        src = tmp / PINNED_IOS_SDK
+        if not src.exists():
+            # Fallback if the pinned name has been renamed upstream.
+            found = list(tmp.glob("iPhoneOS*.sdk"))
+            if not found:
+                die(f"{PINNED_IOS_SDK} not found in theos/sdks. "
+                    "Check the repo manually.")
+            src = found[0]
+        sdk_name = src.name
+        if theos_ready is not None:
+            theos_ready.wait()
+        sdks_dir.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(sdks_dir / sdk_name))
+    good(f"Installed {sdk_name}")
 
 
 def install_zsign():
@@ -279,13 +464,25 @@ def cmd_setup(args):
     info("Setting up IPAWiz build environment...")
     IPAWIZ_DIR.mkdir(exist_ok=True)
 
-    install_system_deps()
-    install_ldid()
-    install_theos()
-    install_toolchain()
-    install_ios_sdk()
+    # One parallel pool: every install step is either self-contained
+    # (install_system_deps, install_ldid, install_zsign) or fetches into a
+    # tempdir and only touches $THEOS_DIR at the end. install_toolchain
+    # and install_ios_sdk wait on `theos_ready` before their move step so
+    # they don't race install_theos's `git clone` (which requires an empty
+    # target). install_theos sets the event in a finally-block so a failed
+    # clone unblocks the waiters instead of hanging the process.
+    theos_ready = threading.Event()
+    tasks = [
+        lambda: install_system_deps(args.sign),
+        lambda: install_theos(done=theos_ready),
+        lambda: install_toolchain(theos_ready=theos_ready),
+        lambda: install_ios_sdk(theos_ready=theos_ready),
+        install_ldid,
+    ]
     if args.sign:
-        install_zsign()
+        tasks.append(install_zsign)
+    _parallel(*tasks)
+
     write_shell_env()
 
     good("Setup complete.")
